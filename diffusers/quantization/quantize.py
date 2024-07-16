@@ -23,8 +23,13 @@ import argparse
 
 import torch
 from diffusers import DiffusionPipeline, StableDiffusionPipeline
+from diffusers import (
+    ControlNetModel,
+    DPMSolverMultistepScheduler,
+    StableDiffusionLatentUpscalePipeline,
+    StableDiffusionControlNetPipeline
+)
 from utils import (
-    check_lora,
     get_fp8_config,
     get_int8_config,
     load_calib_prompts,
@@ -38,16 +43,37 @@ def do_calibrate(pipe, calibration_prompts, **kwargs):
     for i_th, prompts in enumerate(calibration_prompts):
         if i_th >= kwargs["calib_size"]:
             return
+        # pipe(
+        #     prompt=prompts,
+        #     num_inference_steps=kwargs["n_steps"],
+        #     negative_prompt=[
+        #         "normal quality, low quality, worst quality, low res, blurry, nsfw, nude"
+        #     ]
+        #     * len(prompts),
+        # ).images
         pipe(
             prompt=prompts,
-            num_inference_steps=kwargs["n_steps"],
             negative_prompt=[
                 "normal quality, low quality, worst quality, low res, blurry, nsfw, nude"
             ]
             * len(prompts),
-        ).images
-
-
+            # output_type="latent",
+            image=[torch.load("/root/Product_AIGC/test_control_temp_input/input_image_0.pt"), torch.load("/root/Product_AIGC/test_control_temp_input/input_image_1.pt")],
+            generator=torch.manual_seed(11557),
+            num_inference_steps=kwargs["n_steps"],
+            guidance_scale=7.5,
+            # strength=1.0,
+            controlnet_conditioning_scale=[1.0, 1.0]).images
+        # pipe(
+        #     prompt=prompts,
+        #     negative_prompt=[
+        #         "normal quality, low quality, worst quality, low res, blurry, nsfw, nude"
+        #     ]
+        #     * len(prompts),
+        #     image=(torch.load("/root/Product_AIGC/test_sr_temp_input/sr_input_latent.pt"))[0:2],
+        #     generator=torch.manual_seed(11557),
+        #     num_inference_steps=kwargs["n_steps"],
+        #     guidance_scale=0).images
 def main():
     parser = argparse.ArgumentParser()
     # Model hyperparameters
@@ -60,6 +86,8 @@ def main():
             "stabilityai/stable-diffusion-xl-base-1.0",
             "stabilityai/sdxl-turbo",
             "runwayml/stable-diffusion-v1-5",
+            "RV_V51_noninpainting",
+            "sd-x2-latent-upscaler"
         ],
     )
     parser.add_argument(
@@ -78,10 +106,6 @@ def main():
         required=False,
         default="default",
         choices=["global_min", "min-max", "min-mean", "mean-max", "default"],
-        help=(
-            "Ways to collect the amax of each layers, for example, min-max means min(max(step_0),"
-            " max(step_1), ...)"
-        ),
     )
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--calib-size", type=int, default=128)
@@ -102,6 +126,21 @@ def main():
         pipe = StableDiffusionPipeline.from_pretrained(
             args.model, torch_dtype=torch.float16, safety_checker=None
         )
+    elif args.model == "RV_V51_noninpainting":
+        controlnets = []
+        controlnets.append(ControlNetModel.from_pretrained("/checkpoints/control_v11p_sd15_inpaint", torch_dtype=torch.float16))
+        controlnets.append(ControlNetModel.from_pretrained("/checkpoints/huggingface/hub/models--lllyasviel--sd-controlnet-canny/snapshots/7f2f69197050967007f6bbd23ab5e52f0384162a", torch_dtype=torch.float16))
+        pipe = StableDiffusionControlNetPipeline.from_pretrained(
+            "/checkpoints/RV_V51_noninpainting",
+            controlnet = controlnets,
+            safety_checker = None,
+            torch_dtype = torch.float16
+        )
+        pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+            pipe.scheduler.config, use_karras_sigmas=True
+        )
+    elif args.model == "sd-x2-latent-upscaler":
+        pipe = StableDiffusionLatentUpscalePipeline.from_pretrained("/checkpoints/sd-x2-latent-upscaler", torch_dtype=torch.float16)
     else:
         pipe = DiffusionPipeline.from_pretrained(
             args.model,
@@ -114,22 +153,25 @@ def main():
     # This is a list of prompts
     cali_prompts = load_calib_prompts(args.batch_size, "./calib/calib_prompts.txt")
     extra_step = (
-        1 if args.model == "runwayml/stable-diffusion-v1-5" else 0
+        1 if args.model == "runwayml/stable-diffusion-v1-5" or \
+             args.model == "sd-x2-latent-upscaler" or args.model == "RV_V51_noninpainting" else 0
     )  # Depending on the scheduler. some schedulers will do n+1 steps
     if args.format == "int8":
         # Making sure to use global_min in the calibrator for SD 1.5
-        assert args.collect_method != "default"
-        if args.model == "runwayml/stable-diffusion-v1-5":
+        if args.model == "runwayml/stable-diffusion-v1-5" or \
+           args.model == "sd-x2-latent-upscaler" or args.model == "RV_V51_noninpainting":
             args.collect_method = "global_min"
         quant_config = get_int8_config(
-            pipe.unet,
+            # pipe.controlnet,
+            pipe.unet_controlnet,
+            # pipe.unet,
             args.quant_level,
             args.alpha,
             args.percentile,
             args.n_steps + extra_step,
             collect_method=args.collect_method,
         )
-    elif args.format == "fp8":
+    else:
         if args.collect_method == "default":
             quant_config = mtq.FP8_DEFAULT_CFG
         else:
@@ -141,7 +183,9 @@ def main():
             )
 
     def forward_loop(unet):
-        pipe.unet = unet
+        # pipe.unet = unet
+        # pipe.controlnet = unet
+        pipe.unet_controlnet = unet
         do_calibrate(
             pipe=pipe,
             calibration_prompts=cali_prompts,
@@ -149,12 +193,12 @@ def main():
             n_steps=args.n_steps,
         )
 
-    # All the LoRA layers should be fused
-    check_lora(pipe.unet)
-
-    mtq.quantize(pipe.unet, quant_config, forward_loop)
-    mto.save(pipe.unet, f"./unet.state_dict.{args.exp_name}.pt")
-
+    # mtq.quantize(pipe.unet, quant_config, forward_loop)
+    # mto.save(pipe.unet, f"./unet.state_dict.{args.exp_name}.pt")
+    # mtq.quantize(pipe.controlnet, quant_config, forward_loop)
+    # mto.save(pipe.controlnet, f"./unet.state_dict.{args.exp_name}.pt")
+    mtq.quantize(pipe.unet_controlnet, quant_config, forward_loop)
+    mto.save(pipe.unet_controlnet, f"./unet.state_dict.{args.exp_name}.pt")
 
 if __name__ == "__main__":
     main()

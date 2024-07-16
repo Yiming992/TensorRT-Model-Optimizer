@@ -67,6 +67,21 @@ AXES_NAME = {
         "encoder_hidden_states": {0: "batch_size", 1: "sequence_length"},
         "latent": {0: "batch_size", 1: "num_channels", 2: "height", 3: "width"},
     },
+    "RV_V51_noninpainting": {
+        # 目前动态这边暂时只考虑了merge的情况
+        "sample": {0: '2B', 2: 'H', 3: 'W'},
+        # "timestep": {0: "steps"},
+        "encoder_hidden_states": {0: '2B'},
+        'images': {1: '2B', 3: '8H', 4: '8W'},
+        "latent": {0: '2B', 2: 'H', 3: 'W'},
+    },
+    "sd-x2-latent-upscaler": {
+        "sample": {0: "batch_size", 2: "height", 3: "width"},
+        "timestep": {0: "steps"},
+        "encoder_hidden_states": {0: "batch_size"},
+        "timestep_cond": {0: "batch_size"},
+        "latent": {0: "batch_size", 2: "height", 3: "width"},
+    },
 }
 
 # Per-tensor for INT8, we will convert it to FP8 later in onnxgraphsurgeon
@@ -85,17 +100,19 @@ SDXL_FP8_CFG = {
 def generate_fp8_scales(unet):
     # temporary solution due to a known bug in torch.onnx._dynamo_export
     for _, module in unet.named_modules():
-        if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)) and (
-            hasattr(module.input_quantizer, "_amax") and module.input_quantizer is not None
-        ):
+        if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
             module.input_quantizer._num_bits = 8
             module.weight_quantizer._num_bits = 8
-            module.input_quantizer._amax = module.input_quantizer._amax * (127 / 448.0)
-            module.weight_quantizer._amax = module.weight_quantizer._amax * (127 / 448.0)
+            module.input_quantizer._amax = (module.input_quantizer._amax * 127) / 448.0
+            module.weight_quantizer._amax = (module.weight_quantizer._amax * 127) / 448.0
 
 
 def generate_dummy_inputs(sd_version, device):
     dummy_input = {}
+    down_block_res_samples=torch.load("/root/Product_AIGC/res_samples.pt")
+    down_block_res_samples_cpu = [torch.ones_like(d).to(device) for d in down_block_res_samples]
+    down_block_res_samples_cpu = tuple(down_block_res_samples_cpu)
+    print(len(down_block_res_samples_cpu))
     if (
         sd_version == "stabilityai/stable-diffusion-xl-base-1.0"
         or sd_version == "stabilityai/sdxl-turbo"
@@ -110,6 +127,24 @@ def generate_dummy_inputs(sd_version, device):
         dummy_input["sample"] = torch.ones(2, 4, 64, 64).to(device)
         dummy_input["timestep"] = torch.ones(1).to(device)
         dummy_input["encoder_hidden_states"] = torch.ones(2, 16, 768).to(device)
+    elif sd_version == "RV_V51_noninpainting":
+        # 当sd_controlnet并且只输出unet的时候采用下面调用方法
+        # dummy_input["sample"] = torch.ones(8, 4, 64, 64).to(device)
+        # dummy_input["timestep"] = torch.ones(1).to(device)
+        # dummy_input["encoder_hidden_states"] = torch.ones(8, 77, 768).to(device)
+        # dummy_input["down_block_additional_residuals"] = down_block_res_samples_cpu
+        # dummy_input["mid_block_additional_residual"] = torch.ones(8, 1280, 8, 8).to(device)
+        # 采用merge或者只输出sd_controlnet中的controlnet可以用下面这个
+        dummy_input["sample"] = torch.ones(8, 4, 64, 64).to(device)
+        dummy_input["timestep"] = torch.ones(1).to(device)
+        dummy_input["encoder_hidden_states"] = torch.ones(8, 77, 768).to(device)
+        dummy_input["images"] = torch.ones(2, 8, 3, 512, 512).to(device)
+        dummy_input["controlnet_scales"] = torch.ones(2).to(device)
+    elif sd_version == "sd-x2-latent-upscaler":
+        dummy_input["sample"] = torch.ones(2, 8, 128, 128).to(device)
+        dummy_input["timestep"] = torch.ones(1).to(device)
+        dummy_input["encoder_hidden_states"] = torch.ones(2, 77, 768).to(device)
+        dummy_input["timestep_cond"] = torch.ones(2, 896).to(device)
     else:
         raise NotImplementedError(f"Unsupported sd_version: {sd_version}")
 
@@ -130,6 +165,25 @@ def modelopt_export_sd(base, exp_name, model_name):
     elif model_name == "runwayml/stable-diffusion-v1-5":
         input_names = ["sample", "timestep", "encoder_hidden_states"]
         output_names = ["latent"]
+    elif model_name == "RV_V51_noninpainting":
+        # 采用merge或者只输出sd_controlnet中的controlnet可以用下面这个
+        input_names = ['sample', 'timestep', 'encoder_hidden_states', 'images', 'controlnet_scales']
+        # 当sd_controlnet并且只输出unet的时候采用下面调用方法
+        down_block_names = [f"down_block_{i}" for i in range(12)]
+        # input_names = ['sample', 'timestep', 'encoder_hidden_states', 
+        #                *down_block_names,
+        #                 # 'down_block_res_samples_0','down_block_res_samples_1','down_block_res_samples_2','down_block_res_samples_3',
+        #                 # 'down_block_res_samples_4','down_block_res_samples_5','down_block_res_samples_6','down_block_res_samples_7',
+        #                 # 'down_block_res_samples_8','down_block_res_samples_9','down_block_res_samples_10','down_block_res_samples_11',
+        #                 'mid_block_res_sample']
+        output_names = ["latent"]
+        # output_names = ['down_block_res_samples_0','down_block_res_samples_1','down_block_res_samples_2','down_block_res_samples_3',
+        #                 'down_block_res_samples_4','down_block_res_samples_5','down_block_res_samples_6','down_block_res_samples_7',
+        #                 'down_block_res_samples_8','down_block_res_samples_9','down_block_res_samples_10','down_block_res_samples_11',
+        #                 'mid_block_res_sample']
+    elif model_name == "sd-x2-latent-upscaler":
+        input_names = ["sample", "timestep", "encoder_hidden_states", "timestep_cond"]
+        output_names = ["latent"]
     else:
         raise NotImplementedError(f"Unsupported sd_version: {model_name}")
 
@@ -139,7 +193,9 @@ def modelopt_export_sd(base, exp_name, model_name):
 
     # Copied from Huggingface's Optimum
     onnx_export(
-        base.unet,
+        # base.unet,
+        # base.controlnet,
+        base.unet_controlnet,
         (dummy_inputs,),
         f=output.as_posix(),
         input_names=input_names,

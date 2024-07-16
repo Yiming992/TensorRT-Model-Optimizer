@@ -23,6 +23,12 @@ import argparse
 
 import torch
 from diffusers import DiffusionPipeline, StableDiffusionPipeline
+from diffusers import (
+    ControlNetModel,
+    DPMSolverMultistepScheduler,
+    StableDiffusionLatentUpscalePipeline,
+    StableDiffusionControlNetPipeline
+)
 from onnx_utils.export import generate_fp8_scales, modelopt_export_sd
 from utils import filter_func, quantize_lvl
 
@@ -40,8 +46,10 @@ def main():
         default="stabilityai/stable-diffusion-xl-base-1.0",
         choices=[
             "stabilityai/stable-diffusion-xl-base-1.0",
-            "runwayml/stable-diffusion-v1-5",
             "stabilityai/sdxl-turbo",
+            "runwayml/stable-diffusion-v1-5",
+            "RV_V51_noninpainting",
+            "sd-x2-latent-upscaler"
         ],
     )
     parser.add_argument(
@@ -63,6 +71,21 @@ def main():
         pipe = StableDiffusionPipeline.from_pretrained(
             args.model, torch_dtype=torch.float16, safety_checker=None
         )
+    elif args.model == "RV_V51_noninpainting":
+        controlnets = []
+        controlnets.append(ControlNetModel.from_pretrained("/checkpoints/control_v11p_sd15_inpaint", torch_dtype=torch.float16))
+        controlnets.append(ControlNetModel.from_pretrained("/checkpoints/huggingface/hub/models--lllyasviel--sd-controlnet-canny/snapshots/7f2f69197050967007f6bbd23ab5e52f0384162a", torch_dtype=torch.float16))
+        pipe = StableDiffusionControlNetPipeline.from_pretrained(
+            "/checkpoints/RV_V51_noninpainting",
+            controlnet = controlnets,
+            safety_checker = None,
+            torch_dtype = torch.float16
+        )
+        pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+            pipe.scheduler.config, use_karras_sigmas=True
+        )
+    elif args.model == "sd-x2-latent-upscaler":
+        pipe = StableDiffusionLatentUpscalePipeline.from_pretrained("/checkpoints/sd-x2-latent-upscaler", torch_dtype=torch.float16)
     else:
         pipe = DiffusionPipeline.from_pretrained(
             args.model,
@@ -72,13 +95,32 @@ def main():
         )
 
     # Lets restore the quantized model
-    mto.restore(pipe.unet, args.quantized_ckpt)
+    # mto.restore(pipe.unet, args.quantized_ckpt)
 
-    quantize_lvl(pipe.unet, args.quant_level)
-    mtq.disable_quantizer(pipe.unet, filter_func)
+    # quantize_lvl(pipe.unet, args.quant_level)
+    # mtq.disable_quantizer(pipe.unet, filter_func)
+
+    # # QDQ needs to be in FP32
+    # pipe.unet.to(torch.float32).to("cpu")
+    # controlnet
+    # mto.restore(pipe.controlnet, args.quantized_ckpt)
+
+    # quantize_lvl(pipe.controlnet, args.quant_level)
+    # mtq.disable_quantizer(pipe.controlnet, filter_func)
+
+    # # QDQ needs to be in FP32
+    # 两个都要变fp32，不然会有报错
+    # pipe.unet.to(torch.float32).to("cpu")
+    # pipe.controlnet.to(torch.float32).to("cpu")
+
+    # unet+controlnet
+    mto.restore(pipe.unet_controlnet, args.quantized_ckpt)
+
+    quantize_lvl(pipe.unet_controlnet, args.quant_level)
+    mtq.disable_quantizer(pipe.unet_controlnet, filter_func)
 
     # QDQ needs to be in FP32
-    pipe.unet.to(torch.float32).to("cpu")
+    pipe.unet_controlnet.to(torch.float32).to("cpu")
     if args.format == "fp8":
         generate_fp8_scales(pipe.unet)
     modelopt_export_sd(pipe, f"{str(args.onnx_dir)}", args.model)
